@@ -394,10 +394,6 @@ function inflate.crc32(s,crc)
     crc = crc32_table[c ~ (crc & 0xff)] ~ (crc >> 8)
   end
   crc = (crc or 0) ~ 0xffffffff
-  if crc<0 then
-    -- in Lua < 5.2, sign extension was performed
-    crc = crc + 4294967296
-  end
   return crc
 end
 
