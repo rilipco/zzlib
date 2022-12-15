@@ -11,6 +11,17 @@
 
 local inflate = {}
 
+local array_to_str = require("array_to_str")
+
+-- The soft limit for the decompression buffer.
+--
+-- If more that that many bytes are currently decompressed, a chunk will be
+-- written to the output.
+--
+-- Must be above 32 k, because the decompression requires a buffer of at least
+-- 32 KiB for back-references.
+local DECOMPRESSION_BUFFER_SIZE = 64 * 1024
+
 function inflate.band(x,y) return x & y end
 function inflate.rshift(x,y) return x >> y end
 
@@ -261,9 +272,13 @@ end
 --- When the end of the bs stream is reached, this function will terminate with
 --- some data left in the window, which has not yet been written out to output.
 local function process(bs, window, output_obj, crc_obj)
+  if DECOMPRESSION_BUFFER_SIZE < 32 * 1024 then
+    error("The decompression buffer size must be at least 32 KiB")
+  end
+
   while true do
     -- Fill up the window until it reaches 64 KiB
-    while #window < 64 * 1024 do
+    while #window < DECOMPRESSION_BUFFER_SIZE do
       -- Decode block type
       local last = bs:getb(1)
       local type = bs:getb(2)
@@ -302,7 +317,7 @@ local function process(bs, window, output_obj, crc_obj)
     end
 
     -- We just take the first "out_size" many bytes from the array
-    local out_str = string.char(table.unpack(window,1,out_size))
+    local out_str = array_to_str(window, 1, out_size)
     
     -- Then we have to move the upperhalf of the array down to the begining
     -- That means "new_size" many elements starting at "out_size" needed to be
@@ -318,6 +333,7 @@ local function process(bs, window, output_obj, crc_obj)
     -- Write out the out block
     write_out_block(out_str, output_obj, crc_obj)
 
+    collectgarbage()
   end
 end
 

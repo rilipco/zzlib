@@ -23,35 +23,7 @@ end
 
 local zzlib = {}
 
-local function arraytostr(array)
-  local tmp = {}
-  local size = #array
-  local pos = 1
-  local imax = 1
-  while size > 0 do
-    local bsize = size>=2048 and 2048 or size
-    local s = string.char(unpack(array,pos,pos+bsize-1))
-    pos = pos + bsize
-    size = size - bsize
-    local i = 1
-    while tmp[i] do
-      s = tmp[i]..s
-      tmp[i] = nil
-      i = i + 1
-    end
-    if i > imax then
-      imax = i
-    end
-    tmp[i] = s
-  end
-  local str = ""
-  for i=1,imax do
-    if tmp[i] then
-      str = tmp[i]..str
-    end
-  end
-  return str
-end
+local arraytostr = require("array_to_str")
 
 local function inflate_gzip(bs, output)
   local id1,id2,cm,flg = bs.buf:byte(1,4)
@@ -145,7 +117,11 @@ function zzlib.gunzipff(filename_in, filename_out)
   if not file_out then
     return nil,err
   end
-  return inflate_gzip(infl.bitstream_init(file_in), file_out)
+  
+  inflate_gzip(infl.bitstream_init(file_in), file_out)
+
+  file_out:flush()
+  file_out:close()
 end
 
 function zzlib.gunzipf(filename)
