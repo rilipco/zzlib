@@ -53,7 +53,7 @@ local function arraytostr(array)
   return str
 end
 
-local function inflate_gzip(bs)
+local function inflate_gzip(bs, output)
   local id1,id2,cm,flg = bs.buf:byte(1,4)
   if id1 ~= 31 or id2 ~= 139 then
     error("invalid gzip header")
@@ -79,13 +79,14 @@ local function inflate_gzip(bs)
     -- TODO: check header CRC16
     bs.pos = bs.pos+2
   end
-  local result = arraytostr(infl.main(bs))
+  local result, output = infl.main(bs, output)
   local crc = bs:getb(8)+256*(bs:getb(8)+256*(bs:getb(8)+256*bs:getb(8)))
   bs:close()
-  if crc ~= infl.crc32(result) then
+  if crc ~= result then
+    print(crc, result)
     error("checksum verification failed")
   end
-  return result
+  return output
 end
 
 -- compute Adler-32 checksum
@@ -100,7 +101,7 @@ local function adler32(s)
   return s2*65536+s1
 end
 
-local function inflate_zlib(bs)
+local function inflate_zlib(bs, output)
   local cmf = bs.buf:byte(1)
   local flg = bs.buf:byte(2)
   if (cmf*256+flg)%31 ~= 0 then
@@ -116,13 +117,13 @@ local function inflate_zlib(bs)
     error("preset dictionary not implemented")
   end
   bs.pos=3
-  local result = arraytostr(infl.main(bs))
+  local result, output = infl.main(bs, output)
   local adler = ((bs:getb(8)*256+bs:getb(8))*256+bs:getb(8))*256+bs:getb(8)
   bs:close()
   if adler ~= adler32(result) then
     error("checksum verification failed")
   end
-  return result
+  return output
 end
 
 local function inflate_raw(buf,offset,crc)
@@ -133,6 +134,18 @@ local function inflate_raw(buf,offset,crc)
     error("checksum verification failed")
   end
   return result
+end
+
+function zzlib.gunzipff(filename_in, filename_out)
+  local file_in,err = io.open(filename_in,"rb")
+  if not file_in then
+    return nil,err
+  end
+  local file_out,err = io.open(filename_out,"w+")
+  if not file_out then
+    return nil,err
+  end
+  return inflate_gzip(infl.bitstream_init(file_in), file_out)
 end
 
 function zzlib.gunzipf(filename)

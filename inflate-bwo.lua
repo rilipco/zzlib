@@ -145,7 +145,9 @@ local function block_loop(out,bs,nlit,ndist,littable,disttable)
         dist = dist + bs:getb(nbits)
       end
       local p = #out-dist+1
+      if p < 0 then error("Back reference way too far, dist: "..tostring(dist)) end
       while size > 0 do
+        if not out[p] then error("Back reference out of bounds, p: "..tostring(p)) end
         table.insert(out,out[p])
         p = p + 1
         size = size - 1
@@ -233,25 +235,129 @@ local function block_uncompressed(out,bs)
   end
 end
 
-function inflate.main(bs)
-  local last,type
-  local output = {}
-  repeat
-    local block
-    last = bs:getb(1)
-    type = bs:getb(2)
-    if type == 0 then
-      block_uncompressed(output,bs)
-    elseif type == 1 then
-      block_static(output,bs)
-    elseif type == 2 then
-      block_dynamic(output,bs)
+--- Auxiliary function to write out a block of data
+---
+--- `output` may either be a string or an Lua IO file.
+local function write_out_block(block_str, output_obj, crc_obj)
+    -- Update CRC
+    crc_obj.crc = inflate.crc32(block_str, crc_obj.crc)
+
+    -- Output block, according to the output type.
+    -- We only support local string caching, and Lua IO file output
+    if type(output_obj.out) == "string" then
+      output_obj.out = output_obj.out .. block_str
     else
-      error("unsupported block type")
+      -- Just gona assume it is an IO file
+      output_obj.out:write(block_str)
     end
-  until last == 1
+end
+
+--- Auxiliary function to decompress the entire `bs` using the given window
+--- array.
+---
+--- Notice thet Deflate needs at least 32 KiB of past decompressed data for back
+--- references.
+---
+--- When the end of the bs stream is reached, this function will terminate with
+--- some data left in the window, which has not yet been written out to output.
+local function process(bs, window, output_obj, crc_obj)
+  while true do
+    -- Fill up the window until it reaches 64 KiB
+    while #window < 64 * 1024 do
+      -- Decode block type
+      local last = bs:getb(1)
+      local type = bs:getb(2)
+
+      -- Decompress block according to its type
+      if type == 0 then
+        block_uncompressed(window,bs)
+      elseif type == 1 then
+        block_static(window,bs)
+      elseif type == 2 then
+        block_dynamic(window,bs)
+      else
+        error("unsupported block type")
+      end
+
+      -- If last block, just terminate
+      if last == 1 then
+        return
+      end
+    end
+
+    -- Here we got our window full with over 64 KiB, while we only need 32 KiB,
+    -- thus we will write out the oldest 32 KiB, and reduce the used array.
+
+    -- Once we got to 64 KiB let us write out the oldest 32 KiB, thus preserving
+    -- the newer 32 KiB that we need for back-references
+    --
+    -- |            window           | previouly
+    -- +-- out_size --+-- new_size --+
+    -- |   out_str    |    window    | there after
+
+    local new_size = 32 * 1024 -- We need exactly 32 KiB
+    local out_size = #window - new_size
+    if out_size <= 0 then
+      error("Invalid state")
+    end
+
+    -- We just take the first "out_size" many bytes from the array
+    local out_str = string.char(table.unpack(window,1,out_size))
+    
+    -- Then we have to move the upperhalf of the array down to the begining
+    -- That means "new_size" many elements starting at "out_size" needed to be
+    -- move back to the start of the array
+    table.move(window, out_size + 1, out_size + 1 + new_size - 1, 1)
+
+    -- Since a Lua "move" appears to be just a "copy", the old entries must be
+    -- delete there after individually.
+    while #window > new_size do
+      table.remove(window)
+    end
+
+    -- Write out the out block
+    write_out_block(out_str, output_obj, crc_obj)
+
+  end
+end
+
+--- Inflate the given BS into output
+---
+--- Output may be a string, a Lua file (e.g. from `io.open`), or nil (which
+--- defaults) to an empty string.
+---
+--- In case output is a string (or nil), the entire output will be written into
+--- that string, and returned as second return value.
+---
+--- In case output is a file, the decompressed data is directly streamed out to
+--- that file, limiting the amount of main memory used during this operation.
+---
+function inflate.main(bs, output)
+  -- Use inline string by default
+  output = output or ""
+  
+  local output_obj = {out = output}
+
+  -- The decompression window, needed for back references
+  local window = {}
+  -- The CRC of the decompressed data, as Lua table with fild "crc"
+  -- The table is needed to have an object that can be passed around, while
+  -- allowing to share it.
+  local crc_obj = {}
+
+  -- Decompress the entire input (aka bs)
+  process(bs, window, output_obj, crc_obj)
+
+  -- Stringify the rest of the window
+  local win_str = string.char(table.unpack(window))
+
+  -- Write out the very last block
+  write_out_block(win_str, output_obj, crc_obj)
+
   bs:flushb(bs.n&7)
-  return output
+
+  -- Return the CRC and the output object
+  return crc_obj.crc, output_obj.out
 end
 
 local crc32_table
