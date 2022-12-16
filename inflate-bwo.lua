@@ -13,17 +13,159 @@ local inflate = {}
 
 local array_to_str = require("array_to_str")
 
--- The soft limit for the decompression buffer.
+
+-- The size of the streaming blocks.
 --
--- If more that that many bytes are currently decompressed, a chunk will be
--- written to the output.
+-- This is practically the output block size.
+local OUTPUT_STREAM_BLOCK_SIZE = 4 * 1024
+
+
+-- The number of bytes the Deflate algorithm needs for back references.
 --
--- Must be above 32 k, because the decompression requires a buffer of at least
--- 32 KiB for back-references.
-local DECOMPRESSION_BUFFER_SIZE = 64 * 1024
+-- This is exactly 32 KiB, do not change!
+local DECOMPRESSION_BUFFER_SIZE = 32 * 1024
+
 
 function inflate.band(x,y) return x & y end
 function inflate.rshift(x,y) return x >> y end
+
+-- Creates an auxiliary output stream data structure
+local function output_stream(output)
+  local stream = {
+    -- The current CRC value
+    crc = 0,
+    -- The output either a string or a Lua IO File
+    output = output,
+  }
+
+  -- Array of buffers of size `OUTPUT_STREAM_BLOCK_SIZE`, except for the last (highest index)
+  local buffers = {{}}
+
+  -- Index into buffers, which is the newest, and has less than `OUTPUT_STREAM_BLOCK_SIZE` bytes in it
+  local last_buffer_index = 1
+  -- The number of full buffers required for the Deflate algorithmus, any buffer beyond can be written out
+  local required_buffer_amount = (DECOMPRESSION_BUFFER_SIZE + OUTPUT_STREAM_BLOCK_SIZE - 1) // OUTPUT_STREAM_BLOCK_SIZE
+
+  --- Auxiliary function to write out a block of data
+  ---
+  --- `stream.output` must be a string.
+  local function write_out_block_to_string(block_str)
+      -- Update CRC
+      stream.crc = inflate.crc32(block_str, stream.crc)
+
+      -- Output block to string.
+      stream.output = stream.output .. block_str
+  end
+
+  --- Auxiliary function to write out a block of data
+  ---
+  --- `stream.output` must be a Lua IO file.
+  local function write_out_block_to_file(block_str)
+      -- Update CRC
+      stream.crc = inflate.crc32(block_str, stream.crc)
+
+      -- Output block to file.
+      -- Just gona assume it is an IO file
+      stream.output:write(block_str)
+      stream.output:flush()
+  end
+
+  --- Auxiliary function to write out a block of data
+  local output_function
+  -- We only support local string caching, and Lua IO file output
+  if type(stream.output) == "string" then
+    output_function = write_out_block_to_string
+  else
+    output_function = write_out_block_to_file
+  end
+
+  -- Write the given byte to the output
+  function stream:write_byte(b)
+    -- Add byte to newest buffer, by invariant, there is always space remaining
+    table.insert(buffers[last_buffer_index], b)
+
+    -- Check whether the buffer is full
+    local size = #buffers[last_buffer_index]
+    if size >= OUTPUT_STREAM_BLOCK_SIZE then
+      if size > OUTPUT_STREAM_BLOCK_SIZE then
+        error("Invalid state")
+      end
+
+      -- Check buffer amount, at this point all buffers are full,
+      -- if we have more that we need, we will write them out
+      if #buffers > required_buffer_amount then
+        -- Remove the oldest buffer
+        local out_buf = table.remove(buffers,1)
+        last_buffer_index = last_buffer_index - 1
+
+        -- Stringify and send to output
+        local out_str = array_to_str(out_buf)
+        output_function(out_str)
+
+        collectgarbage()
+        --print("GC: " .. tostring(collectgarbage("count")))
+      end
+
+      -- Add a new empty buffer
+      table.insert(buffers, {})
+      last_buffer_index = last_buffer_index + 1
+    end
+  end
+
+  -- Write out all cached bytes to the output
+  function stream:flush()
+    for _,buf in ipairs(buffers) do
+      local out_str = array_to_str(buf)
+      output_function(out_str)
+    end
+
+    -- Reset state
+    buffers = {{}}
+    last_buffer_index = 1
+  end
+
+  -- Looks for the byte written `dist` bytes in the past
+  function stream:lookup_byte(dist)
+    -- Make dist zero-based
+    dist = dist - 1
+
+    if dist > DECOMPRESSION_BUFFER_SIZE then
+      error("Tried to look up a byte way too far in the past")
+    end
+
+    local latest_size = #buffers[last_buffer_index]
+
+    -- The buffer to extract the byte from
+    local selected_buffer
+    -- The number of bytes to go back within the selected buffer
+    local go_back_bytes
+
+    if dist < latest_size then
+      -- Just use the latest buffer
+      selected_buffer = buffers[last_buffer_index]
+
+      go_back_bytes = dist
+
+    else
+      -- Full buffers distance, that is after ignoring the half-full latest buffer
+      local full_dist = dist - latest_size
+
+      local go_back_buffers = full_dist // OUTPUT_STREAM_BLOCK_SIZE
+      go_back_bytes = full_dist % OUTPUT_STREAM_BLOCK_SIZE
+
+      -- We will never select the latest buffer here, it's handled above
+      selected_buffer = buffers[last_buffer_index - 1 - go_back_buffers]
+    end
+    
+    if #selected_buffer <= go_back_bytes then
+      error("Try to access buffer out-of-bounds")
+    end
+
+    return selected_buffer[#selected_buffer - go_back_bytes]
+  end
+
+  return stream
+end
 
 function inflate.bitstream_init(file)
   local bs = {
@@ -126,12 +268,12 @@ local function hufftable_create(depths)
   return table,nbits
 end
 
-local function block_loop(out,bs,nlit,ndist,littable,disttable)
+local function block_loop(out_stream,bs,nlit,ndist,littable,disttable)
   local lit
   repeat
     lit = bs:getv(littable,nlit)
     if lit < 256 then
-      table.insert(out,lit)
+      out_stream:write_byte(lit)
     elseif lit > 256 then
       local nbits = 0
       local size = 3
@@ -155,12 +297,12 @@ local function block_loop(out,bs,nlit,ndist,littable,disttable)
         dist = dist + (((v&1)+2) << nbits)
         dist = dist + bs:getb(nbits)
       end
-      local p = #out-dist+1
-      if p < 0 then error("Back reference way too far, dist: "..tostring(dist)) end
+
       while size > 0 do
-        if not out[p] then error("Back reference out of bounds, p: "..tostring(p)) end
-        table.insert(out,out[p])
-        p = p + 1
+        -- Since adding a new byte to the stream updates the "distance"
+        -- we just repeatedly add bytes with the same distance.
+        out_stream:write_byte(out_stream:lookup_byte(dist))
+
         size = size - 1
       end
     end
@@ -231,7 +373,7 @@ local function block_static(out,bs)
   block_loop(out,bs,nlit,ndist,littable,disttable)
 end
 
-local function block_uncompressed(out,bs)
+local function block_uncompressed(out_stream,bs)
   bs:flushb(bs.n&7)
   local len = bs:getb(16)
   if bs.n > 0 then
@@ -242,98 +384,7 @@ local function block_uncompressed(out,bs)
     error("LEN and NLEN don't match")
   end
   for i=1,len do
-    table.insert(out,bs:next_byte())
-  end
-end
-
---- Auxiliary function to write out a block of data
----
---- `output` may either be a string or an Lua IO file.
-local function write_out_block(block_str, output_obj, crc_obj)
-    -- Update CRC
-    crc_obj.crc = inflate.crc32(block_str, crc_obj.crc)
-
-    -- Output block, according to the output type.
-    -- We only support local string caching, and Lua IO file output
-    if type(output_obj.out) == "string" then
-      output_obj.out = output_obj.out .. block_str
-    else
-      -- Just gona assume it is an IO file
-      output_obj.out:write(block_str)
-    end
-end
-
---- Auxiliary function to decompress the entire `bs` using the given window
---- array.
----
---- Notice thet Deflate needs at least 32 KiB of past decompressed data for back
---- references.
----
---- When the end of the bs stream is reached, this function will terminate with
---- some data left in the window, which has not yet been written out to output.
-local function process(bs, window, output_obj, crc_obj)
-  if DECOMPRESSION_BUFFER_SIZE < 32 * 1024 then
-    error("The decompression buffer size must be at least 32 KiB")
-  end
-
-  while true do
-    -- Fill up the window until it reaches 64 KiB
-    while #window < DECOMPRESSION_BUFFER_SIZE do
-      -- Decode block type
-      local last = bs:getb(1)
-      local type = bs:getb(2)
-
-      -- Decompress block according to its type
-      if type == 0 then
-        block_uncompressed(window,bs)
-      elseif type == 1 then
-        block_static(window,bs)
-      elseif type == 2 then
-        block_dynamic(window,bs)
-      else
-        error("unsupported block type")
-      end
-
-      -- If last block, just terminate
-      if last == 1 then
-        return
-      end
-    end
-
-    -- Here we got our window full with over 64 KiB, while we only need 32 KiB,
-    -- thus we will write out the oldest 32 KiB, and reduce the used array.
-
-    -- Once we got to 64 KiB let us write out the oldest 32 KiB, thus preserving
-    -- the newer 32 KiB that we need for back-references
-    --
-    -- |            window           | previouly
-    -- +-- out_size --+-- new_size --+
-    -- |   out_str    |    window    | there after
-
-    local new_size = 32 * 1024 -- We need exactly 32 KiB
-    local out_size = #window - new_size
-    if out_size <= 0 then
-      error("Invalid state")
-    end
-
-    -- We just take the first "out_size" many bytes from the array
-    local out_str = array_to_str(window, 1, out_size)
-    
-    -- Then we have to move the upperhalf of the array down to the begining
-    -- That means "new_size" many elements starting at "out_size" needed to be
-    -- move back to the start of the array
-    table.move(window, out_size + 1, out_size + 1 + new_size - 1, 1)
-
-    -- Since a Lua "move" appears to be just a "copy", the old entries must be
-    -- delete there after individually.
-    while #window > new_size do
-      table.remove(window)
-    end
-
-    -- Write out the out block
-    write_out_block(out_str, output_obj, crc_obj)
-
-    collectgarbage()
+    out_stream:write_byte(bs:next_byte())
   end
 end
 
@@ -352,28 +403,36 @@ function inflate.main(bs, output)
   -- Use inline string by default
   output = output or ""
   
-  local output_obj = {out = output}
-
-  -- The decompression window, needed for back references
-  local window = {}
-  -- The CRC of the decompressed data, as Lua table with fild "crc"
-  -- The table is needed to have an object that can be passed around, while
-  -- allowing to share it.
-  local crc_obj = {}
+  -- The decompression window, needed for back references, and output writer in one
+  -- This combined structure allows to limit the RAM usage
+  local out_stream = output_stream(output)
 
   -- Decompress the entire input (aka bs)
-  process(bs, window, output_obj, crc_obj)
+  repeat
+    -- Decode block type
+    local last = bs:getb(1)
+    local type = bs:getb(2)
 
-  -- Stringify the rest of the window
-  local win_str = string.char(table.unpack(window))
+    -- Decompress block according to its type
+    if type == 0 then
+      block_uncompressed(out_stream,bs)
+    elseif type == 1 then
+      block_static(out_stream,bs)
+    elseif type == 2 then
+      block_dynamic(out_stream,bs)
+    else
+      error("unsupported block type")
+    end
 
-  -- Write out the very last block
-  write_out_block(win_str, output_obj, crc_obj)
+  until last == 1
+
+  -- Write out the 32 KiB back-reference buffers
+  out_stream:flush()
 
   bs:flushb(bs.n&7)
 
   -- Return the CRC and the output object
-  return crc_obj.crc, output_obj.out
+  return out_stream.crc, out_stream.out
 end
 
 local crc32_table
