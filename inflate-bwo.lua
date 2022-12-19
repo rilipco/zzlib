@@ -11,7 +11,7 @@
 
 local inflate = {}
 
-local array_to_str = require("array_to_str")
+local array_to_str = require("array-to-str")
 
 
 -- The size of the streaming blocks.

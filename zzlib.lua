@@ -23,7 +23,7 @@ end
 
 local zzlib = {}
 
-local arraytostr = require("array_to_str")
+local arraytostr = require("array-to-str")
 
 local function inflate_gzip(bs, output)
   local id1,id2,cm,flg = bs.buf:byte(1,4)
