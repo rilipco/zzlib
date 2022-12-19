@@ -19,6 +19,9 @@ local array_to_str = require("array_to_str")
 -- This is practically the output block size.
 local OUTPUT_STREAM_BLOCK_SIZE = 4 * 1024
 
+-- The size of the input blocks.
+local INPUT_BLOCK_SIZE = 4 * 1024
+
 
 -- The number of bytes the Deflate algorithm needs for back references.
 --
@@ -184,7 +187,7 @@ function inflate.bitstream_init(file)
   -- returns the next byte from the stream, excluding any half-read bytes
   function bs:next_byte()
     if self.pos > self.len then
-      self.buf = self.file:read(4096)
+      self.buf = self.file:read(INPUT_BLOCK_SIZE)
       self.len = self.buf:len()
       self.pos = 1
     end
@@ -225,7 +228,7 @@ function inflate.bitstream_init(file)
     bs.file = nil
     bs.buf = file
   else
-    bs.buf = file:read(4096)
+    bs.buf = file:read(INPUT_BLOCK_SIZE)
   end
   bs.len = bs.buf:len()
   return bs
